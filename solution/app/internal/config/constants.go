@@ -3,6 +3,9 @@ package config
 import "time"
 
 const (
+	SentinelHostsEnv          = "SENTINEL_HOSTS"
+	SentinelMasterNameEnv     = "SENTINEL_MASTER_NAME"
+	WorkerConsumerEnv         = "NOTIFICATIONS_CONSUMER"
 	DefaultSentinelHosts      = "sentinel-1:26379,sentinel-2:26379,sentinel-3:26379"
 	DefaultSentinelMasterName = "mymaster"
 	RedisDialTimeout          = 2 * time.Second
@@ -11,22 +14,29 @@ const (
 	RedisMaxRetries           = 3
 	RedisBusyGroupPrefix      = "BUSYGROUP"
 
-	LeaderboardKey         = "tournament:main"
-	NotificationsStream    = "notifications"
-	NotificationsGroup     = "notifications-group"
-	LevelChangedEventType  = "level_changed"
-	StreamGroupNewOnlyID   = "$"
-	StreamNewMessagesID    = ">"
-	StreamPendingID        = "0"
-	NotificationsRetention = 7 * 24 * time.Hour
-	TimestampLayout        = "2006-01-02T15:04:05.000000-07:00"
+	LeaderboardKey                         = "tournament:main"
+	NotificationsStream                    = "notifications"
+	NotificationsGroup                     = "notifications-group"
+	LevelChangedEventType                  = "level_changed"
+	StreamGroupNewOnlyID                   = "$"
+	StreamNewMessagesID                    = ">"
+	StreamPendingID                        = "0"
+	NotificationsRetention                 = 7 * 24 * time.Hour
+	TimestampLayout                        = "2006-01-02T15:04:05.000000-07:00"
+	TimestampWithoutZoneWithFractionLayout = "2006-01-02T15:04:05.999999999"
+	TimestampWithoutZoneLayout             = "2006-01-02T15:04:05"
 
 	APIListenAddress                 = ":8000"
+	DecimalBase                      = 10
+	Int64BitSize                     = 64
+	MicrosecondsPerSecond            = 1_000_000
+	MicrosecondsPerMillisecond       = 1_000
 	RedisStartupTimeout              = time.Minute
 	RedisStartupAttemptTimeout       = 3 * time.Second
 	RedisStartupRetryDelay           = time.Second
 	ProfileCacheTTL                  = time.Minute
 	LoginTTL                         = 24 * time.Hour
+	LoginScriptResultValues          = 2
 	MaxRequestBodyBytes        int64 = 1 << 20
 	MaxPlayerNameRunes               = 120
 	MaxRegionRunes                   = 80

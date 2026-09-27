@@ -134,18 +134,19 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 func readJSON(w http.ResponseWriter, r *http.Request, value any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, config.MaxRequestBodyBytes))
 	if err := decoder.Decode(value); err != nil {
-		return &apiError{http.StatusUnprocessableEntity, "Invalid request body"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid request body"}
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
-		return &apiError{http.StatusUnprocessableEntity, "Invalid request body"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid request body"}
 	}
 	return nil
 }
 
-func playerID(r *http.Request, name string) (int64, error) {
-	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+func playerID(r *http.Request, pathParameterName string) (int64, error) {
+	rawID := r.PathValue(pathParameterName)
+	id, err := strconv.ParseInt(rawID, config.DecimalBase, config.Int64BitSize)
 	if err != nil || id < 1 {
-		return 0, &apiError{http.StatusUnprocessableEntity, "Player ID must be positive"}
+		return 0, &apiError{status: http.StatusUnprocessableEntity, detail: "Player ID must be positive"}
 	}
 	return id, nil
 }
@@ -158,7 +159,7 @@ func validatePlayer(player playerInput) error {
 	if player.Name == nil || utf8.RuneCountInString(*player.Name) < 1 || utf8.RuneCountInString(*player.Name) > config.MaxPlayerNameRunes ||
 		player.Level == nil || *player.Level < 1 ||
 		player.Region == nil || utf8.RuneCountInString(*player.Region) < 1 || utf8.RuneCountInString(*player.Region) > config.MaxRegionRunes {
-		return &apiError{http.StatusUnprocessableEntity, "Invalid player data"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid player data"}
 	}
 	return nil
 }
@@ -169,15 +170,16 @@ func timestamp(value *string) (string, error) {
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, *value)
 	if err != nil {
-		for _, plain := range []string{"2006-01-02T15:04:05.999999999", "2006-01-02T15:04:05"} {
-			parsed, err = time.ParseInLocation(plain, *value, time.UTC)
+		layouts := []string{config.TimestampWithoutZoneWithFractionLayout, config.TimestampWithoutZoneLayout}
+		for _, layout := range layouts {
+			parsed, err = time.ParseInLocation(layout, *value, time.UTC)
 			if err == nil {
 				break
 			}
 		}
 	}
 	if err != nil {
-		return "", &apiError{http.StatusUnprocessableEntity, "Invalid created_at"}
+		return "", &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid created_at"}
 	}
 	return parsed.UTC().Format(config.TimestampLayout), nil
 }
@@ -192,18 +194,25 @@ func playerData(player playerInput) (map[string]string, error) {
 	}
 	return map[string]string{
 		"name":       *player.Name,
-		"level":      strconv.FormatInt(*player.Level, 10),
+		"level":      strconv.FormatInt(*player.Level, config.DecimalBase),
 		"region":     *player.Region,
 		"created_at": createdAt,
 	}, nil
 }
 
 func playerResponse(id int64, raw map[string]string) (playerOutput, error) {
-	level, err := strconv.ParseInt(raw["level"], 10, 64)
+	rawLevel := raw["level"]
+	level, err := strconv.ParseInt(rawLevel, config.DecimalBase, config.Int64BitSize)
 	if err != nil {
 		return playerOutput{}, err
 	}
-	return playerOutput{id, raw["name"], level, raw["region"], raw["created_at"]}, nil
+	return playerOutput{
+		ID:        id,
+		Name:      raw["name"],
+		Level:     level,
+		Region:    raw["region"],
+		CreatedAt: raw["created_at"],
+	}, nil
 }
 
 func (s *server) requirePlayer(ctx context.Context, id int64) error {
@@ -212,7 +221,7 @@ func (s *server) requirePlayer(ctx context.Context, id int64) error {
 		return err
 	}
 	if exists == 0 {
-		return &apiError{http.StatusNotFound, "Player not found"}
+		return &apiError{status: http.StatusNotFound, detail: "Player not found"}
 	}
 	return nil
 }
@@ -233,7 +242,7 @@ func (s *server) createPlayersBatch(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	if len(body.Players) < 1 || len(body.Players) > config.MaxBatchPlayers {
-		return &apiError{http.StatusUnprocessableEntity, "Batch must contain 1 to 100 players"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Batch must contain 1 to 100 players"}
 	}
 
 	ids := make([]int64, 0, len(body.Players))
@@ -241,13 +250,18 @@ func (s *server) createPlayersBatch(w http.ResponseWriter, r *http.Request) erro
 	seen := make(map[int64]bool)
 	for _, player := range body.Players {
 		if player.ID == nil || *player.ID < 1 {
-			return &apiError{http.StatusUnprocessableEntity, "Player ID must be positive"}
+			return &apiError{status: http.StatusUnprocessableEntity, detail: "Player ID must be positive"}
 		}
 		if seen[*player.ID] {
-			return &apiError{http.StatusUnprocessableEntity, "Player IDs must be unique"}
+			return &apiError{status: http.StatusUnprocessableEntity, detail: "Player IDs must be unique"}
 		}
 		seen[*player.ID] = true
-		profile, err := playerData(playerInput{player.Name, player.Level, player.Region, player.CreatedAt})
+		profile, err := playerData(playerInput{
+			Name:      player.Name,
+			Level:     player.Level,
+			Region:    player.Region,
+			CreatedAt: player.CreatedAt,
+		})
 		if err != nil {
 			return err
 		}
@@ -286,7 +300,9 @@ func (s *server) createPlayersBatch(w http.ResponseWriter, r *http.Request) erro
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-	elapsedMS := math.Round(time.Since(started).Seconds()*1_000_000) / 1000
+	elapsedSeconds := time.Since(started).Seconds()
+	elapsedMicroseconds := math.Round(elapsedSeconds * config.MicrosecondsPerSecond)
+	elapsedMS := elapsedMicroseconds / config.MicrosecondsPerMillisecond
 	writeJSON(w, http.StatusOK, map[string]any{"loaded": len(ids), "player_ids": ids, "elapsed_ms": elapsedMS})
 	return nil
 }
@@ -355,7 +371,7 @@ func (s *server) getPlayer(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if len(raw) == 0 {
-		return &apiError{http.StatusNotFound, "Player not found"}
+		return &apiError{status: http.StatusNotFound, detail: "Player not found"}
 	}
 	profile, err := playerResponse(id, raw)
 	if err != nil {
@@ -383,7 +399,7 @@ func (s *server) changeLevel(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if body.Delta == nil || *body.Delta == 0 {
-		return &apiError{http.StatusUnprocessableEntity, "Delta must not be zero"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Delta must not be zero"}
 	}
 
 	ctx := r.Context()
@@ -393,16 +409,18 @@ func (s *server) changeLevel(w http.ResponseWriter, r *http.Request) error {
 		err = s.master.Watch(ctx, func(tx *redis.Tx) error {
 			current, err := tx.HGet(ctx, playerKey(id), "level").Int64()
 			if errors.Is(err, redis.Nil) {
-				return &apiError{http.StatusNotFound, "Player not found"}
+				return &apiError{status: http.StatusNotFound, detail: "Player not found"}
 			}
 			if err != nil {
 				return err
 			}
-			if current+*body.Delta < 1 {
-				return &apiError{http.StatusUnprocessableEntity, "Level must remain positive"}
+			nextLevel := current + *body.Delta
+			if nextLevel < 1 {
+				return &apiError{status: http.StatusUnprocessableEntity, detail: "Level must remain positive"}
 			}
 			now := time.Now().UTC()
-			cutoff := fmt.Sprintf("%d-0", now.Add(-config.NotificationsRetention).UnixMilli())
+			oldestAllowedTime := now.Add(-config.NotificationsRetention)
+			oldestNotificationID := fmt.Sprintf("%d-0", oldestAllowedTime.UnixMilli())
 			var levelCmd *redis.IntCmd
 			var notificationCmd *redis.StringCmd
 			// WATCH защищает проверку уровня от двух одновременных PATCH-запросов
@@ -418,7 +436,7 @@ func (s *server) changeLevel(w http.ResponseWriter, r *http.Request) error {
 						"timestamp": now.Format(config.TimestampLayout),
 					},
 				})
-				pipe.XTrimMinID(ctx, config.NotificationsStream, cutoff)
+				pipe.XTrimMinID(ctx, config.NotificationsStream, oldestNotificationID)
 				return nil
 			})
 			if err == nil {
@@ -449,19 +467,23 @@ func (s *server) recordLogin(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// INCR и обновление TTL нужны как одна операция, поэтому здесь короткий Lua-скрипт
-	result, err := s.master.Eval(ctx, loginScript, []string{fmt.Sprintf("logins:%d", id)}, int64(config.LoginTTL/time.Second)).Result()
+	loginKey := fmt.Sprintf("logins:%d", id)
+	ttlSeconds := int64(config.LoginTTL / time.Second)
+	result, err := s.master.Eval(ctx, loginScript, []string{loginKey}, ttlSeconds).Result()
 	if err != nil {
 		return err
 	}
 	values, ok := result.([]any)
-	if !ok || len(values) != 2 {
+	if !ok || len(values) != config.LoginScriptResultValues {
 		return errors.New("unexpected login script result")
 	}
-	count, err := asInt64(values[0])
+	rawCount := values[0]
+	rawTTL := values[1]
+	count, err := asInt64(rawCount)
 	if err != nil {
 		return err
 	}
-	ttl, err := asInt64(values[1])
+	ttl, err := asInt64(rawTTL)
 	if err != nil {
 		return err
 	}
@@ -470,11 +492,11 @@ func (s *server) recordLogin(w http.ResponseWriter, r *http.Request) error {
 }
 
 func asInt64(value any) (int64, error) {
-	switch v := value.(type) {
+	switch parsedValue := value.(type) {
 	case int64:
-		return v, nil
+		return parsedValue, nil
 	case string:
-		return strconv.ParseInt(v, 10, 64)
+		return strconv.ParseInt(parsedValue, config.DecimalBase, config.Int64BitSize)
 	default:
 		return 0, fmt.Errorf("unexpected Redis integer: %T", value)
 	}
@@ -489,13 +511,15 @@ func (s *server) addScore(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if body.PlayerID == nil || *body.PlayerID < 1 || body.Score == nil {
-		return &apiError{http.StatusUnprocessableEntity, "Invalid score data"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid score data"}
 	}
 	ctx := r.Context()
 	if err := s.requirePlayer(ctx, *body.PlayerID); err != nil {
 		return err
 	}
-	score, err := s.master.ZIncrBy(ctx, config.LeaderboardKey, float64(*body.Score), strconv.FormatInt(*body.PlayerID, 10)).Result()
+	scoreDelta := float64(*body.Score)
+	memberID := strconv.FormatInt(*body.PlayerID, config.DecimalBase)
+	score, err := s.master.ZIncrBy(ctx, config.LeaderboardKey, scoreDelta, memberID).Result()
 	if err != nil {
 		return err
 	}
@@ -506,25 +530,27 @@ func (s *server) addScore(w http.ResponseWriter, r *http.Request) error {
 func (s *server) leaderboardTop(w http.ResponseWriter, r *http.Request) error {
 	limit := config.DefaultLeaderboardLimit
 	if values, ok := r.URL.Query()["limit"]; ok {
-		value := values[0]
-		parsed, err := strconv.ParseInt(value, 10, 64)
+		rawLimit := values[0]
+		parsed, err := strconv.ParseInt(rawLimit, config.DecimalBase, config.Int64BitSize)
 		if err != nil || parsed < 1 || parsed > config.MaxLeaderboardLimit {
-			return &apiError{http.StatusUnprocessableEntity, "Limit must be between 1 and 100"}
+			return &apiError{status: http.StatusUnprocessableEntity, detail: "Limit must be between 1 and 100"}
 		}
 		limit = parsed
 	}
 	ctx := r.Context()
-	entries, err := s.replica.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, limit-1).Result()
+	lastIndex := limit - 1
+	entries, err := s.replica.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, lastIndex).Result()
 	// Реплика иногда ещё не получила свежую запись, поэтому пустой ответ перепроверяем у мастера
 	if err != nil || len(entries) == 0 {
-		entries, err = s.master.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, limit-1).Result()
+		entries, err = s.master.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, lastIndex).Result()
 		if err != nil {
 			return err
 		}
 	}
 	players := make([]map[string]any, 0, len(entries))
 	for position, item := range entries {
-		id, err := strconv.ParseInt(fmt.Sprint(item.Member), 10, 64)
+		rawMemberID := fmt.Sprint(item.Member)
+		id, err := strconv.ParseInt(rawMemberID, config.DecimalBase, config.Int64BitSize)
 		if err != nil {
 			return err
 		}
@@ -540,7 +566,7 @@ func (s *server) leaderboardRank(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	ctx := r.Context()
-	member := strconv.FormatInt(id, 10)
+	member := strconv.FormatInt(id, config.DecimalBase)
 	rank, err := s.replica.ZRevRank(ctx, config.LeaderboardKey, member).Result()
 	readFrom := s.replica
 	if err != nil {
@@ -551,7 +577,7 @@ func (s *server) leaderboardRank(w http.ResponseWriter, r *http.Request) error {
 		readFrom = s.master
 	}
 	if errors.Is(err, redis.Nil) {
-		return &apiError{http.StatusNotFound, "Player is not on the leaderboard"}
+		return &apiError{status: http.StatusNotFound, detail: "Player is not on the leaderboard"}
 	}
 	if err != nil {
 		return err
@@ -579,7 +605,7 @@ func (s *server) addAchievement(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if body.Name == nil || utf8.RuneCountInString(*body.Name) < 1 || utf8.RuneCountInString(*body.Name) > config.MaxAchievementNameRunes {
-		return &apiError{http.StatusUnprocessableEntity, "Invalid achievement name"}
+		return &apiError{status: http.StatusUnprocessableEntity, detail: "Invalid achievement name"}
 	}
 	ctx := r.Context()
 	if err := s.requirePlayer(ctx, id); err != nil {

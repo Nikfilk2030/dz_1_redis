@@ -10,26 +10,27 @@ import (
 )
 
 func options() *redis.FailoverOptions {
-	addresses := os.Getenv("SENTINEL_HOSTS")
+	addresses := os.Getenv(config.SentinelHostsEnv)
 	if addresses == "" {
 		addresses = config.DefaultSentinelHosts
 	}
 
-	hosts := make([]string, 0, 3)
-	for _, address := range strings.Split(addresses, ",") {
+	rawHosts := strings.Split(addresses, ",")
+	hosts := make([]string, 0, len(rawHosts))
+	for _, address := range rawHosts {
 		address = strings.TrimSpace(address)
 		if address != "" {
 			hosts = append(hosts, address)
 		}
 	}
 
-	name := os.Getenv("SENTINEL_MASTER_NAME")
-	if name == "" {
-		name = config.DefaultSentinelMasterName
+	masterName := os.Getenv(config.SentinelMasterNameEnv)
+	if masterName == "" {
+		masterName = config.DefaultSentinelMasterName
 	}
 
 	return &redis.FailoverOptions{
-		MasterName:    name,
+		MasterName:    masterName,
 		SentinelAddrs: hosts,
 		DialTimeout:   config.RedisDialTimeout,
 		ReadTimeout:   config.RedisReadTimeout,
@@ -39,11 +40,12 @@ func options() *redis.FailoverOptions {
 }
 
 func Master() *redis.Client {
-	return redis.NewFailoverClient(options())
+	failoverOptions := options()
+	return redis.NewFailoverClient(failoverOptions)
 }
 
 func Replica() *redis.Client {
-	opts := options()
-	opts.ReplicaOnly = true
-	return redis.NewFailoverClient(opts)
+	failoverOptions := options()
+	failoverOptions.ReplicaOnly = true
+	return redis.NewFailoverClient(failoverOptions)
 }

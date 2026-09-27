@@ -20,7 +20,7 @@ func main() {
 	client := redisconn.Master()
 	defer client.Close()
 
-	consumer := os.Getenv("NOTIFICATIONS_CONSUMER")
+	consumer := os.Getenv(config.WorkerConsumerEnv)
 	if consumer == "" {
 		consumer = config.DefaultWorkerConsumer
 	}
@@ -51,8 +51,9 @@ func main() {
 
 		if time.Since(lastTrim) >= config.WorkerTrimInterval {
 			// У записей Stream нет своего TTL, поэтому режем по времени в ID
-			cutoff := time.Now().Add(-config.NotificationsRetention).UnixMilli()
-			if err := client.XTrimMinID(ctx, config.NotificationsStream, fmt.Sprintf("%d-0", cutoff)).Err(); err != nil {
+			oldestAllowedTime := time.Now().Add(-config.NotificationsRetention)
+			oldestNotificationID := fmt.Sprintf("%d-0", oldestAllowedTime.UnixMilli())
+			if err := client.XTrimMinID(ctx, config.NotificationsStream, oldestNotificationID).Err(); err != nil {
 				log.Printf("Redis worker error: %v", err)
 				groupReady = false
 				time.Sleep(config.WorkerRetryDelay)
