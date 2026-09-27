@@ -1,0 +1,129 @@
+x-redis: &redis
+  image: redis:7-alpine
+  restart: unless-stopped
+  command: [/bin/sh, /usr/local/bin/redis-start.sh]
+  healthcheck:
+    test: [CMD, redis-cli, ping]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+x-sentinel: &sentinel
+  image: redis:7-alpine
+  restart: unless-stopped
+  command:
+    - /bin/sh
+    - -ec
+    - |
+      if [ ! -f /data/sentinel.conf ]; then
+        cp /etc/redis/sentinel.conf /data/sentinel.conf
+        printf 'sentinel announce-ip %s\n' "$$SENTINEL_ANNOUNCE_IP" >> /data/sentinel.conf
+      fi
+      exec docker-entrypoint.sh redis-server /data/sentinel.conf --sentinel
+  healthcheck:
+    test: [CMD, redis-cli, -p, '26379', ping]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+x-app: &app
+  build: ./app
+  restart: unless-stopped
+  environment:
+    SENTINEL_HOSTS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+    SENTINEL_MASTER_NAME: mymaster
+  depends_on:
+    sentinel-1:
+      condition: service_healthy
+    sentinel-2:
+      condition: service_healthy
+    sentinel-3:
+      condition: service_healthy
+
+services:
+  redis-master:
+    <<: *redis
+    container_name: redis-master
+    environment:
+      REDIS_NODE_NAME: redis-master
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/start.sh:/usr/local/bin/redis-start.sh:ro
+      - redis-master-data:/data
+
+  redis-replica-1:
+    <<: *redis
+    container_name: redis-replica-1
+    environment:
+      REDIS_NODE_NAME: redis-replica-1
+    ports:
+      - '127.0.0.1:6380:6379'
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/start.sh:/usr/local/bin/redis-start.sh:ro
+      - redis-replica-1-data:/data
+
+  redis-replica-2:
+    <<: *redis
+    container_name: redis-replica-2
+    environment:
+      REDIS_NODE_NAME: redis-replica-2
+    ports:
+      - '127.0.0.1:6381:6379'
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./redis/start.sh:/usr/local/bin/redis-start.sh:ro
+      - redis-replica-2-data:/data
+
+  sentinel-1:
+    <<: *sentinel
+    container_name: sentinel-1
+    environment:
+      SENTINEL_ANNOUNCE_IP: sentinel-1
+    ports:
+      - '127.0.0.1:26379:26379'
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+      - sentinel-1-data:/data
+
+  sentinel-2:
+    <<: *sentinel
+    container_name: sentinel-2
+    environment:
+      SENTINEL_ANNOUNCE_IP: sentinel-2
+    ports:
+      - '127.0.0.1:26380:26379'
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+      - sentinel-2-data:/data
+
+  sentinel-3:
+    <<: *sentinel
+    container_name: sentinel-3
+    environment:
+      SENTINEL_ANNOUNCE_IP: sentinel-3
+    ports:
+      - '127.0.0.1:26381:26379'
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+      - sentinel-3-data:/data
+
+  api:
+    <<: *app
+    command: [/usr/local/bin/api]
+    ports:
+      - '127.0.0.1:8000:8000'
+
+  worker:
+    <<: *app
+    command: [/usr/local/bin/worker]
+
+volumes:
+  redis-master-data:
+  redis-replica-1-data:
+  redis-replica-2-data:
+  sentinel-1-data:
+  sentinel-2-data:
+  sentinel-3-data:
