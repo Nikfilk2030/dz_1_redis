@@ -15,19 +15,16 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"gamehub/internal/config"
 	"gamehub/internal/redisconn"
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	leaderboardKey   = "tournament:main"
-	notificationsKey = "notifications"
-	loginScript      = `
+const loginScript = `
 local count = redis.call('INCR', KEYS[1])
 redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
 return {count, redis.call('TTL', KEYS[1])}
 `
-)
 
 type server struct {
 	master  *redis.Client
@@ -43,7 +40,7 @@ func (e *apiError) Error() string { return e.detail }
 
 type endpoint func(http.ResponseWriter, *http.Request) error
 
-// Указатели помогают отличить пропущенное поле от нуля в JSON.
+// Указатели помогают отличить пропущенное поле от нуля в JSON
 type playerInput struct {
 	Name      *string `json:"name"`
 	Level     *int64  `json:"level"`
@@ -89,25 +86,25 @@ func main() {
 	mux.HandleFunc("GET /api/players/{player_id}/achievements/{name}", s.handle(s.hasAchievement))
 	mux.HandleFunc("GET /api/players/{id1}/achievements/common/{id2}", s.handle(s.commonAchievements))
 
-	log.Println("API listening on :8000")
-	log.Fatal(http.ListenAndServe(":8000", mux))
+	log.Printf("API listening on %s", config.APIListenAddress)
+	log.Fatal(http.ListenAndServe(config.APIListenAddress, mux))
 }
 
 func (s *server) waitForRedis() error {
-	// Sentinel и Redis стартуют не одновременно. Даём им время договориться о мастере.
-	deadline := time.Now().Add(time.Minute)
+	// Sentinel и Redis стартуют не одновременно, даём им время договориться о мастере
+	deadline := time.Now().Add(config.RedisStartupTimeout)
 	for time.Now().Before(deadline) {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), config.RedisStartupAttemptTimeout)
 		err := s.master.Ping(ctx).Err()
 		if err == nil {
-			err = s.master.XGroupCreateMkStream(ctx, notificationsKey, "notifications-group", "$").Err()
-			if err == nil || strings.Contains(err.Error(), "BUSYGROUP") {
+			err = s.master.XGroupCreateMkStream(ctx, config.NotificationsStream, config.NotificationsGroup, config.StreamGroupNewOnlyID).Err()
+			if err == nil || strings.HasPrefix(err.Error(), config.RedisBusyGroupPrefix) {
 				cancel()
 				return nil
 			}
 		}
 		cancel()
-		time.Sleep(time.Second)
+		time.Sleep(config.RedisStartupRetryDelay)
 	}
 	return errors.New("Redis or notifications group did not become ready")
 }
@@ -135,7 +132,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, value any) error {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, config.MaxRequestBodyBytes))
 	if err := decoder.Decode(value); err != nil {
 		return &apiError{http.StatusUnprocessableEntity, "Invalid request body"}
 	}
@@ -158,18 +155,17 @@ func achievementKey(id int64) string { return fmt.Sprintf("achievements:%d", id)
 func cacheKey(id int64) string       { return fmt.Sprintf("cache:player:%d", id) }
 
 func validatePlayer(player playerInput) error {
-	if player.Name == nil || utf8.RuneCountInString(*player.Name) < 1 || utf8.RuneCountInString(*player.Name) > 120 ||
+	if player.Name == nil || utf8.RuneCountInString(*player.Name) < 1 || utf8.RuneCountInString(*player.Name) > config.MaxPlayerNameRunes ||
 		player.Level == nil || *player.Level < 1 ||
-		player.Region == nil || utf8.RuneCountInString(*player.Region) < 1 || utf8.RuneCountInString(*player.Region) > 80 {
+		player.Region == nil || utf8.RuneCountInString(*player.Region) < 1 || utf8.RuneCountInString(*player.Region) > config.MaxRegionRunes {
 		return &apiError{http.StatusUnprocessableEntity, "Invalid player data"}
 	}
 	return nil
 }
 
 func timestamp(value *string) (string, error) {
-	const layout = "2006-01-02T15:04:05.000000-07:00"
 	if value == nil {
-		return time.Now().UTC().Format(layout), nil
+		return time.Now().UTC().Format(config.TimestampLayout), nil
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, *value)
 	if err != nil {
@@ -183,7 +179,7 @@ func timestamp(value *string) (string, error) {
 	if err != nil {
 		return "", &apiError{http.StatusUnprocessableEntity, "Invalid created_at"}
 	}
-	return parsed.UTC().Format(layout), nil
+	return parsed.UTC().Format(config.TimestampLayout), nil
 }
 
 func playerData(player playerInput) (map[string]string, error) {
@@ -236,7 +232,7 @@ func (s *server) createPlayersBatch(w http.ResponseWriter, r *http.Request) erro
 	if err := readJSON(w, r, &body); err != nil {
 		return err
 	}
-	if len(body.Players) < 1 || len(body.Players) > 100 {
+	if len(body.Players) < 1 || len(body.Players) > config.MaxBatchPlayers {
 		return &apiError{http.StatusUnprocessableEntity, "Batch must contain 1 to 100 players"}
 	}
 
@@ -261,7 +257,7 @@ func (s *server) createPlayersBatch(w http.ResponseWriter, r *http.Request) erro
 
 	started := time.Now()
 	ctx := r.Context()
-	// Сначала читаем старые даты одним пакетом, потом обновляем все профили одной транзакцией.
+	// Сначала читаем старые даты одним пакетом, потом обновляем все профили одной транзакцией
 	readPipe := s.master.Pipeline()
 	previous := make(map[int]*redis.StringCmd)
 	for i, player := range body.Players {
@@ -369,7 +365,7 @@ func (s *server) getPlayer(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	_ = s.master.Set(ctx, cacheKey(id), encoded, time.Minute).Err()
+	_ = s.master.Set(ctx, cacheKey(id), encoded, config.ProfileCacheTTL).Err()
 	w.Header().Set("X-Cache", "MISS")
 	writeJSON(w, http.StatusOK, profile)
 	return nil
@@ -406,23 +402,23 @@ func (s *server) changeLevel(w http.ResponseWriter, r *http.Request) error {
 				return &apiError{http.StatusUnprocessableEntity, "Level must remain positive"}
 			}
 			now := time.Now().UTC()
-			cutoff := fmt.Sprintf("%d-0", now.Add(-7*24*time.Hour).UnixMilli())
+			cutoff := fmt.Sprintf("%d-0", now.Add(-config.NotificationsRetention).UnixMilli())
 			var levelCmd *redis.IntCmd
 			var notificationCmd *redis.StringCmd
-			// WATCH защищает проверку уровня от двух одновременных PATCH-запросов.
+			// WATCH защищает проверку уровня от двух одновременных PATCH-запросов
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				levelCmd = pipe.HIncrBy(ctx, playerKey(id), "level", *body.Delta)
 				pipe.Del(ctx, cacheKey(id))
 				notificationCmd = pipe.XAdd(ctx, &redis.XAddArgs{
-					Stream: notificationsKey,
+					Stream: config.NotificationsStream,
 					Values: map[string]any{
 						"player_id": id,
-						"type":      "level_changed",
+						"type":      config.LevelChangedEventType,
 						"message":   fmt.Sprintf("Player %d level changed by %+d", id, *body.Delta),
-						"timestamp": now.Format("2006-01-02T15:04:05.000000-07:00"),
+						"timestamp": now.Format(config.TimestampLayout),
 					},
 				})
-				pipe.XTrimMinID(ctx, notificationsKey, cutoff)
+				pipe.XTrimMinID(ctx, config.NotificationsStream, cutoff)
 				return nil
 			})
 			if err == nil {
@@ -452,8 +448,8 @@ func (s *server) recordLogin(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requirePlayer(ctx, id); err != nil {
 		return err
 	}
-	// INCR и обновление TTL нужны как одна операция, поэтому здесь короткий Lua-скрипт.
-	result, err := s.master.Eval(ctx, loginScript, []string{fmt.Sprintf("logins:%d", id)}, 86400).Result()
+	// INCR и обновление TTL нужны как одна операция, поэтому здесь короткий Lua-скрипт
+	result, err := s.master.Eval(ctx, loginScript, []string{fmt.Sprintf("logins:%d", id)}, int64(config.LoginTTL/time.Second)).Result()
 	if err != nil {
 		return err
 	}
@@ -499,7 +495,7 @@ func (s *server) addScore(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requirePlayer(ctx, *body.PlayerID); err != nil {
 		return err
 	}
-	score, err := s.master.ZIncrBy(ctx, leaderboardKey, float64(*body.Score), strconv.FormatInt(*body.PlayerID, 10)).Result()
+	score, err := s.master.ZIncrBy(ctx, config.LeaderboardKey, float64(*body.Score), strconv.FormatInt(*body.PlayerID, 10)).Result()
 	if err != nil {
 		return err
 	}
@@ -508,20 +504,20 @@ func (s *server) addScore(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *server) leaderboardTop(w http.ResponseWriter, r *http.Request) error {
-	limit := int64(10)
+	limit := config.DefaultLeaderboardLimit
 	if values, ok := r.URL.Query()["limit"]; ok {
 		value := values[0]
 		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed < 1 || parsed > 100 {
+		if err != nil || parsed < 1 || parsed > config.MaxLeaderboardLimit {
 			return &apiError{http.StatusUnprocessableEntity, "Limit must be between 1 and 100"}
 		}
 		limit = parsed
 	}
 	ctx := r.Context()
-	entries, err := s.replica.ZRevRangeWithScores(ctx, leaderboardKey, 0, limit-1).Result()
-	// Реплика иногда ещё не получила свежую запись, поэтому пустой ответ перепроверяем у мастера.
+	entries, err := s.replica.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, limit-1).Result()
+	// Реплика иногда ещё не получила свежую запись, поэтому пустой ответ перепроверяем у мастера
 	if err != nil || len(entries) == 0 {
-		entries, err = s.master.ZRevRangeWithScores(ctx, leaderboardKey, 0, limit-1).Result()
+		entries, err = s.master.ZRevRangeWithScores(ctx, config.LeaderboardKey, 0, limit-1).Result()
 		if err != nil {
 			return err
 		}
@@ -545,13 +541,13 @@ func (s *server) leaderboardRank(w http.ResponseWriter, r *http.Request) error {
 	}
 	ctx := r.Context()
 	member := strconv.FormatInt(id, 10)
-	rank, err := s.replica.ZRevRank(ctx, leaderboardKey, member).Result()
+	rank, err := s.replica.ZRevRank(ctx, config.LeaderboardKey, member).Result()
 	readFrom := s.replica
 	if err != nil {
 		if !errors.Is(err, redis.Nil) {
 			log.Printf("replica rank read failed: %v", err)
 		}
-		rank, err = s.master.ZRevRank(ctx, leaderboardKey, member).Result()
+		rank, err = s.master.ZRevRank(ctx, config.LeaderboardKey, member).Result()
 		readFrom = s.master
 	}
 	if errors.Is(err, redis.Nil) {
@@ -560,9 +556,9 @@ func (s *server) leaderboardRank(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	score, err := readFrom.ZScore(ctx, leaderboardKey, member).Result()
+	score, err := readFrom.ZScore(ctx, config.LeaderboardKey, member).Result()
 	if err != nil && readFrom == s.replica {
-		score, err = s.master.ZScore(ctx, leaderboardKey, member).Result()
+		score, err = s.master.ZScore(ctx, config.LeaderboardKey, member).Result()
 	}
 	if err != nil {
 		return err
@@ -582,7 +578,7 @@ func (s *server) addAchievement(w http.ResponseWriter, r *http.Request) error {
 	if err := readJSON(w, r, &body); err != nil {
 		return err
 	}
-	if body.Name == nil || utf8.RuneCountInString(*body.Name) < 1 || utf8.RuneCountInString(*body.Name) > 120 {
+	if body.Name == nil || utf8.RuneCountInString(*body.Name) < 1 || utf8.RuneCountInString(*body.Name) > config.MaxAchievementNameRunes {
 		return &apiError{http.StatusUnprocessableEntity, "Invalid achievement name"}
 	}
 	ctx := r.Context()

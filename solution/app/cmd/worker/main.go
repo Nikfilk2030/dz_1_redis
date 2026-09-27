@@ -10,14 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"gamehub/internal/config"
 	"gamehub/internal/redisconn"
 
 	"github.com/redis/go-redis/v9"
-)
-
-const (
-	stream = "notifications"
-	group  = "notifications-group"
 )
 
 func main() {
@@ -26,7 +22,7 @@ func main() {
 
 	consumer := os.Getenv("NOTIFICATIONS_CONSUMER")
 	if consumer == "" {
-		consumer = "worker-1"
+		consumer = config.DefaultWorkerConsumer
 	}
 
 	ctx := context.Background()
@@ -37,40 +33,40 @@ func main() {
 		if !groupReady {
 			if err := client.Ping(ctx).Err(); err != nil {
 				log.Printf("Redis worker error: %v", err)
-				time.Sleep(2 * time.Second)
+				time.Sleep(config.WorkerRetryDelay)
 				continue
 			}
 			if err := ensureGroup(ctx, client); err != nil {
 				log.Printf("Redis worker error: %v", err)
-				time.Sleep(2 * time.Second)
+				time.Sleep(config.WorkerRetryDelay)
 				continue
 			}
 			if err := drainPending(ctx, client, consumer); err != nil {
 				log.Printf("Redis worker error: %v", err)
-				time.Sleep(2 * time.Second)
+				time.Sleep(config.WorkerRetryDelay)
 				continue
 			}
 			groupReady = true
 		}
 
-		if time.Since(lastTrim) >= time.Minute {
-			// У записей Stream нет своего TTL, поэтому режем по времени в ID.
-			cutoff := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
-			if err := client.XTrimMinID(ctx, stream, fmt.Sprintf("%d-0", cutoff)).Err(); err != nil {
+		if time.Since(lastTrim) >= config.WorkerTrimInterval {
+			// У записей Stream нет своего TTL, поэтому режем по времени в ID
+			cutoff := time.Now().Add(-config.NotificationsRetention).UnixMilli()
+			if err := client.XTrimMinID(ctx, config.NotificationsStream, fmt.Sprintf("%d-0", cutoff)).Err(); err != nil {
 				log.Printf("Redis worker error: %v", err)
 				groupReady = false
-				time.Sleep(2 * time.Second)
+				time.Sleep(config.WorkerRetryDelay)
 				continue
 			}
 			lastTrim = time.Now()
 		}
 
 		messages, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    group,
+			Group:    config.NotificationsGroup,
 			Consumer: consumer,
-			Streams:  []string{stream, ">"},
-			Count:    100,
-			Block:    5 * time.Second,
+			Streams:  []string{config.NotificationsStream, config.StreamNewMessagesID},
+			Count:    config.WorkerReadBatchSize,
+			Block:    config.WorkerReadBlock,
 		}).Result()
 		if errors.Is(err, redis.Nil) {
 			continue
@@ -81,14 +77,14 @@ func main() {
 		if err != nil {
 			log.Printf("Redis worker error: %v", err)
 			groupReady = false
-			time.Sleep(2 * time.Second)
+			time.Sleep(config.WorkerRetryDelay)
 		}
 	}
 }
 
 func ensureGroup(ctx context.Context, client *redis.Client) error {
-	err := client.XGroupCreateMkStream(ctx, stream, group, "$").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+	err := client.XGroupCreateMkStream(ctx, config.NotificationsStream, config.NotificationsGroup, config.StreamGroupNewOnlyID).Err()
+	if err != nil && !strings.HasPrefix(err.Error(), config.RedisBusyGroupPrefix) {
 		return err
 	}
 	return nil
@@ -96,12 +92,12 @@ func ensureGroup(ctx context.Context, client *redis.Client) error {
 
 func drainPending(ctx context.Context, client *redis.Client, consumer string) error {
 	for {
-		// "0" возвращает сообщения, уже выданные этому consumer, но ещё без XACK.
+		// Забираем сообщения, которые этот worker получил раньше, но не успел подтвердить
 		messages, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    group,
+			Group:    config.NotificationsGroup,
 			Consumer: consumer,
-			Streams:  []string{stream, "0"},
-			Count:    100,
+			Streams:  []string{config.NotificationsStream, config.StreamPendingID},
+			Count:    config.WorkerReadBatchSize,
 		}).Result()
 		if errors.Is(err, redis.Nil) {
 			return nil
@@ -137,7 +133,7 @@ func handleMessages(ctx context.Context, client *redis.Client, streams []redis.X
 				}
 				fmt.Println(string(data))
 			}
-			if err := client.XAck(ctx, stream, group, message.ID).Err(); err != nil {
+			if err := client.XAck(ctx, config.NotificationsStream, config.NotificationsGroup, message.ID).Err(); err != nil {
 				return err
 			}
 		}

@@ -120,6 +120,14 @@ services:
     <<: *app
     command: [/usr/local/bin/worker]
 
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:5540:5540'
+    volumes:
+      - redisinsight-data:/data
+
 volumes:
   redis-master-data:
   redis-replica-1-data:
@@ -127,3 +135,4 @@ volumes:
   sentinel-1-data:
   sentinel-2-data:
   sentinel-3-data:
+  redisinsight-data:

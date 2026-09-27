@@ -3,7 +3,8 @@ package redisconn
 import (
 	"os"
 	"strings"
-	"time"
+
+	"gamehub/internal/config"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -11,7 +12,7 @@ import (
 func options() *redis.FailoverOptions {
 	addresses := os.Getenv("SENTINEL_HOSTS")
 	if addresses == "" {
-		addresses = "sentinel-1:26379,sentinel-2:26379,sentinel-3:26379"
+		addresses = config.DefaultSentinelHosts
 	}
 
 	hosts := make([]string, 0, 3)
@@ -24,16 +25,16 @@ func options() *redis.FailoverOptions {
 
 	name := os.Getenv("SENTINEL_MASTER_NAME")
 	if name == "" {
-		name = "mymaster"
+		name = config.DefaultSentinelMasterName
 	}
 
 	return &redis.FailoverOptions{
 		MasterName:    name,
 		SentinelAddrs: hosts,
-		DialTimeout:   2 * time.Second,
-		ReadTimeout:   10 * time.Second,
-		WriteTimeout:  10 * time.Second,
-		MaxRetries:    3,
+		DialTimeout:   config.RedisDialTimeout,
+		ReadTimeout:   config.RedisReadTimeout,
+		WriteTimeout:  config.RedisWriteTimeout,
+		MaxRetries:    config.RedisMaxRetries,
 	}
 }
 

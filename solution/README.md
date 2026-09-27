@@ -7,28 +7,29 @@ flowchart LR
     Client["Клиент API: curl (или программа)"] <-- "HTTP-запрос / JSON-ответ" --> API["Go API"]
     API -- "записывает данные" --> Master["Redis master"]
     API <-- "сначала читает рейтинг и достижения" --> Replicas["2 Redis replicas"]
-    API <-- "читает профиль и кеш;<br/>рейтинг и достижения — если с реплики не вышло" --> Master
+    API <-- "читает профиль и кеш,<br/>а рейтинг и достижения — если с реплики не вышло" --> Master
     Master -- "репликация" --> Replicas
     Worker["Go worker: работает постоянно"] <-- "читает Stream и подтверждает сообщения" --> Master
 ```
 
-Клиент API — в наших проверках человек с `curl`; вместо него может быть программа. API отвечает ему JSON. Сайта, ролей пользователей и администраторов в этом решении нет. Логи worker — обычный вывод контейнера, который можно посмотреть командой `docker compose logs worker`; отдельного «просмотрщика логов» нет.
+Клиент API — в наших проверках человек с `curl`, но на его месте может быть программа. API отвечает ему JSON. Сайта, ролей пользователей и администраторов в этом решении нет. Логи worker — обычный вывод контейнера. Посмотреть их можно командой `docker compose logs worker`. Отдельного «просмотрщика логов» нет.
 
 ## Файлы
 
 | Файл | Что там |
 | --- | --- |
-| `docker-compose.yml` | Redis: мастер и две реплики; три Sentinel; API; worker |
+| `docker-compose.yml` | Мастер Redis, две реплики, три Sentinel, API, worker и RedisInsight |
 | `redis/redis.conf` | RDB, AOF, память, защита от записи без реплик |
 | `redis/sentinel.conf`, `redis/start.sh` | Настройки Sentinel и запуск узлов Redis |
 | `app/cmd/api/main.go` | HTTP API, операции с Redis, счётчик входов на Lua |
-| `app/internal/redisconn/redisconn.go` | Подключение через Sentinel |
+| `app/internal/config/constants.go` | Общие имена, таймауты и лимиты для API и worker |
+| `app/internal/redisconn/redisconn.go` | Общее подключение API и worker через Sentinel |
 | `app/cmd/worker/main.go` | Чтение и подтверждение уведомлений из Stream |
 | `app/Dockerfile`, `app/go.mod`, `app/go.sum` | Сборка Go и зависимости |
 
 ## Архитектура
 
-`api` и `worker` находят текущий мастер через три Sentinel (`mymaster`, quorum 2). У Redis один мастер и две реплики. API пишет в мастер и читает из него профиль и кеш. Рейтинг и достижения API сначала читает с реплики; при ошибке или когда реплика не нашла данные повторяет запрос к мастеру. Если реплика вернула непустые, но устаревшие данные, API этого не замечает.
+`api` и `worker` находят текущий мастер через три Sentinel (`mymaster`, quorum 2). У Redis один мастер и две реплики. API пишет в мастер и читает из него профиль и кеш. Рейтинг и достижения API сначала читает с реплики. Если возникает ошибка или реплика не находит данные, API пробует прочитать их у мастера. Если реплика вернула непустые, но устаревшие данные, API этого не замечает.
 
 `worker` — отдельный контейнер без HTTP-маршрутов. Он работает постоянно, ожидая сообщения в Stream `notifications`. Никто не вызывает его напрямую: при изменении уровня API кладёт сообщение в Redis, worker забирает его через `XREADGROUP`, печатает в логи и подтверждает через `XACK`.
 
@@ -47,13 +48,17 @@ curl -sS http://localhost:8000/health
 
 API: `http://localhost:8000`.
 
+RedisInsight: `http://localhost:5540`. При первом открытии он покажет свои условия использования. После их принятия при добавлении базы выбери подключение через Sentinel. Адрес `sentinel-1`, порт `26379`, имя мастера `mymaster`. Если интерфейс предложит добавить другие Sentinel, укажи `sentinel-2:26379` и `sentinel-3:26379`. Здесь нужны имена контейнеров, потому что RedisInsight работает внутри Docker.
+
+Проверка RedisInsight: `curl -sS http://localhost:5540/api/health/`.
+
 Проверка сборки без Docker: `(cd app && go build ./...)`.
 
 ## API
 
 | Метод | Адрес | Тело |
 | --- | --- | --- |
-| `POST` | `/api/players/{id}` | `name`, `level`, `region`; `created_at` необязателен |
+| `POST` | `/api/players/{id}` | `name`, `level`, `region`. `created_at` можно не указывать |
 | `GET` | `/api/players/{id}` | — |
 | `PATCH` | `/api/players/{id}/level` | `delta` |
 | `POST` | `/api/players/{id}/login` | — |
